@@ -182,6 +182,13 @@ try:
 except importlib_metadata.PackageNotFoundError:
     _accelerate_available = False
 
+_jdiffusion_available = importlib.util.find_spec("JDiffusion") is not None
+try:
+    _jdiffusion_version = importlib_metadata.version("JDiffusion")
+    logger.debug(f"Successfully imported JDiffusion version {_jdiffusion_version}")
+except importlib_metadata.PackageNotFoundError:
+    _jdiffusion_available = False
+
 _xformers_available = importlib.util.find_spec("xformers") is not None
 try:
     _xformers_version = importlib_metadata.version("xformers")
@@ -320,6 +327,8 @@ def is_xformers_available():
 def is_accelerate_available():
     return _accelerate_available
 
+def is_jdiffusion_available():
+    return _jdiffusion_available
 
 def is_k_diffusion_available():
     return _k_diffusion_available

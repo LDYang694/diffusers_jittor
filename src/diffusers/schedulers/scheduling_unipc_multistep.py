@@ -252,7 +252,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         else:
             sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
             sigma_last = ((1 - self.alphas_cumprod[0]) / self.alphas_cumprod[0]) ** 0.5
-            sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
+            #TODO: tmp fix
+            sigmas = np.concatenate([sigmas, [sigma_last.item()]]).astype(np.float32)
 
         self.sigmas = torch.from_numpy(sigmas)
         self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)

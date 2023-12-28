@@ -317,6 +317,8 @@ def get_class_obj_and_candidates(library_name, class_name, importable_classes, p
         library = importlib.import_module(library_name)
 
         class_obj = getattr(library, class_name)
+        if library_name == 'JDiffusion':
+            library = importlib.import_module('diffusers')
         class_candidates = {c: getattr(library, c, None) for c in importable_classes.keys()}
 
     return class_obj, class_candidates
@@ -386,6 +388,7 @@ def load_sub_model(
 ):
     """Helper method to load the module `name` from `library_name` and `class_name`"""
     # retrieve class candidates
+    # breakpoint()
     class_obj, class_candidates = get_class_obj_and_candidates(
         library_name, class_name, importable_classes, pipelines, is_pipeline_module
     )
@@ -397,6 +400,7 @@ def load_sub_model(
             load_method_name = importable_classes[class_name][1]
 
     # if load method name is None, then we have a dummy module -> raise Error
+    # breakpoint()
     if load_method_name is None:
         none_module = class_obj.__module__
         is_dummy_path = none_module.startswith(DUMMY_MODULES_FOLDER) or none_module.startswith(
