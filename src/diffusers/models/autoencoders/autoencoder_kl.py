@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -233,9 +234,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         self.set_attn_processor(processor)
 
     @apply_forward_hook
-    def encode(
-        self, x: torch.FloatTensor, return_dict: bool = True
-    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+    def encode(self, x: torch.FloatTensor, return_dict: bool = True) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
         """
         Encode a batch of images into latents.
 

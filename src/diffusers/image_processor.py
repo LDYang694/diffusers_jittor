@@ -520,7 +520,7 @@ class VaeImageProcessor(ConfigMixin):
                 image = self.resize(image, height, width)
 
         elif isinstance(image[0], torch.Tensor):
-            image = torch.cat(image, axis=0) if image[0].ndim == 4 else torch.stack(image, axis=0)
+            image = torch.cat(image, dim=0) if image[0].ndim == 4 else torch.stack(image, dim=0)
 
             if self.config.do_convert_grayscale and image.ndim == 3:
                 image = image.unsqueeze(1)

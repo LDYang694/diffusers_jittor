@@ -58,13 +58,14 @@ class BaseOutput(OrderedDict):
         `static_graph=True` with modules that output `ModelOutput` subclasses.
         """
         if is_torch_available():
-            import torch.utils._pytree
+            return
+            # import torch.utils._pytree
 
-            torch.utils._pytree._register_pytree_node(
-                cls,
-                torch.utils._pytree._dict_flatten,
-                lambda values, context: cls(**torch.utils._pytree._dict_unflatten(values, context)),
-            )
+            # torch.utils._pytree._register_pytree_node(
+            #     cls,
+            #     torch.utils._pytree._dict_flatten,
+            #     lambda values, context: cls(**torch.utils._pytree._dict_unflatten(values, context)),
+            # )
 
     def __post_init__(self) -> None:
         class_fields = fields(self)

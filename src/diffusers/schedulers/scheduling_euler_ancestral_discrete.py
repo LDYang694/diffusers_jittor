@@ -353,11 +353,12 @@ class EulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         """
 
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
+        # if (
+        #     isinstance(timestep, int)
+        #     or isinstance(timestep, torch.IntTensor)
+        #     or isinstance(timestep, torch.LongTensor)
+        # ):
+        if( isinstance(timestep, int) or (isinstance(timestep,torch.Tensor) and (timestep.dtype == torch.int64  or timestep.dtype == torch.int32))):
             raise ValueError(
                 (
                     "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
