@@ -16,7 +16,6 @@
 import argparse
 import copy
 import gc
-import hashlib
 import importlib
 import itertools
 import logging
@@ -35,6 +34,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, model_info, upload_folder
+from huggingface_hub.utils import insecure_hashlib
 from packaging import version
 from PIL import Image
 from PIL.ImageOps import exif_transpose
@@ -55,13 +55,14 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 
 
 if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.22.0.dev0")
+check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -129,16 +130,14 @@ def log_validation(
     if vae is not None:
         pipeline_args["vae"] = vae
 
-    if text_encoder is not None:
-        text_encoder = accelerator.unwrap_model(text_encoder)
-
     # create pipeline (note: unet and vae are loaded again in float32)
     pipeline = DiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         tokenizer=tokenizer,
         text_encoder=text_encoder,
-        unet=accelerator.unwrap_model(unet),
+        unet=unet,
         revision=args.revision,
+        variant=args.variant,
         torch_dtype=weight_dtype,
         **pipeline_args,
     )
@@ -239,10 +238,13 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         required=False,
-        help=(
-            "Revision of pretrained model identifier from huggingface.co/models. Trainable model components should be"
-            " float32 precision."
-        ),
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
         "--tokenizer_name",
@@ -296,7 +298,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="text-inversion-model",
+        default="dreambooth-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -790,6 +792,7 @@ def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_atte
     prompt_embeds = text_encoder(
         text_input_ids,
         attention_mask=attention_mask,
+        return_dict=False,
     )
     prompt_embeds = prompt_embeds[0]
 
@@ -859,6 +862,7 @@ def main(args):
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
+                variant=args.variant,
             )
             pipeline.set_progress_bar_config(disable=True)
 
@@ -877,7 +881,7 @@ def main(args):
                 images = pipeline(example["prompt"]).images
 
                 for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
                     image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
                     image.save(image_filename)
 
@@ -912,25 +916,30 @@ def main(args):
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
 
     if model_has_vae(args):
         vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
     else:
         vae = None
 
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
-                sub_dir = "unet" if isinstance(model, type(accelerator.unwrap_model(unet))) else "text_encoder"
+                sub_dir = "unet" if isinstance(model, type(unwrap_model(unet))) else "text_encoder"
                 model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                 # make sure to pop weight so that corresponding model is not saved again
@@ -941,7 +950,7 @@ def main(args):
             # pop models so that they are not loaded again
             model = models.pop()
 
-            if isinstance(model, type(accelerator.unwrap_model(text_encoder))):
+            if isinstance(model, type(unwrap_model(text_encoder))):
                 # load transformers style into model
                 load_model = text_encoder_cls.from_pretrained(input_dir, subfolder="text_encoder")
                 model.config = load_model.config
@@ -986,15 +995,12 @@ def main(args):
         " doing mixed precision training. copy of the weights should still be float32."
     )
 
-    if accelerator.unwrap_model(unet).dtype != torch.float32:
-        raise ValueError(
-            f"Unet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
-        )
+    if unwrap_model(unet).dtype != torch.float32:
+        raise ValueError(f"Unet loaded as datatype {unwrap_model(unet).dtype}. {low_precision_error_string}")
 
-    if args.train_text_encoder and accelerator.unwrap_model(text_encoder).dtype != torch.float32:
+    if args.train_text_encoder and unwrap_model(text_encoder).dtype != torch.float32:
         raise ValueError(
-            f"Text encoder loaded as datatype {accelerator.unwrap_model(text_encoder).dtype}."
-            f" {low_precision_error_string}"
+            f"Text encoder loaded as datatype {unwrap_model(text_encoder).dtype}." f" {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -1119,7 +1125,7 @@ def main(args):
             unet, optimizer, train_dataloader, lr_scheduler
         )
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -1167,7 +1173,7 @@ def main(args):
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
-            # Get the mos recent checkpoint
+            # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -1178,30 +1184,30 @@ def main(args):
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
+            initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
-            resume_global_step = global_step * args.gradient_accumulation_steps
+            initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+    else:
+        initial_global_step = 0
 
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         if args.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
-
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
 
@@ -1241,7 +1247,7 @@ def main(args):
                         text_encoder_use_attention_mask=args.text_encoder_use_attention_mask,
                     )
 
-                if accelerator.unwrap_model(unet).config.in_channels == channels * 2:
+                if unwrap_model(unet).config.in_channels == channels * 2:
                     noisy_model_input = torch.cat([noisy_model_input, noisy_model_input], dim=1)
 
                 if args.class_labels_conditioning == "timesteps":
@@ -1251,8 +1257,8 @@ def main(args):
 
                 # Predict the noise residual
                 model_pred = unet(
-                    noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels
-                ).sample
+                    noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels, return_dict=False
+                )[0]
 
                 if model_pred.shape[1] == 6:
                     model_pred, _ = torch.chunk(model_pred, 2, dim=1)
@@ -1345,9 +1351,9 @@ def main(args):
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         images = log_validation(
-                            text_encoder,
+                            unwrap_model(text_encoder) if text_encoder is not None else text_encoder,
                             tokenizer,
-                            unet,
+                            unwrap_model(unet),
                             vae,
                             args,
                             accelerator,
@@ -1364,21 +1370,22 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-    # Create the pipeline using using the trained modules and save it.
+    # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         pipeline_args = {}
 
         if text_encoder is not None:
-            pipeline_args["text_encoder"] = accelerator.unwrap_model(text_encoder)
+            pipeline_args["text_encoder"] = unwrap_model(text_encoder)
 
         if args.skip_save_text_encoder:
             pipeline_args["text_encoder"] = None
 
         pipeline = DiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet),
+            unet=unwrap_model(unet),
             revision=args.revision,
+            variant=args.variant,
             **pipeline_args,
         )
 

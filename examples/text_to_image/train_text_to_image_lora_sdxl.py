@@ -16,14 +16,12 @@
 """Fine-tuning script for Stable Diffusion XL for text2image with support for LoRA."""
 
 import argparse
-import itertools
 import logging
 import math
 import os
 import random
 import shutil
 from pathlib import Path
-from typing import Dict
 
 import datasets
 import numpy as np
@@ -33,10 +31,12 @@ import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
@@ -49,16 +49,16 @@ from diffusers import (
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
 )
-from diffusers.loaders import LoraLoaderMixin, text_encoder_lora_state_dict
-from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
+from diffusers.loaders import LoraLoaderMixin
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import compute_snr
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.training_utils import cast_training_params, compute_snr
+from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.22.0.dev0")
+check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -146,6 +146,12 @@ def parse_args(input_args=None):
         default=None,
         required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
         "--dataset_name",
@@ -430,22 +436,6 @@ DATASET_NAME_MAPPING = {
 }
 
 
-def unet_attn_processors_state_dict(unet) -> Dict[str, torch.tensor]:
-    """
-    Returns:
-        a state dict containing just the attention processor parameters.
-    """
-    attn_processors = unet.attn_processors
-
-    attn_processors_state_dict = {}
-
-    for attn_processor_key, attn_processor in attn_processors.items():
-        for parameter_key, parameter in attn_processor.state_dict().items():
-            attn_processors_state_dict[f"{attn_processor_key}.{parameter_key}"] = parameter
-
-    return attn_processors_state_dict
-
-
 def tokenize_prompt(tokenizer, prompt):
     text_inputs = tokenizer(
         prompt,
@@ -471,13 +461,12 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
             text_input_ids = text_input_ids_list[i]
 
         prompt_embeds = text_encoder(
-            text_input_ids.to(text_encoder.device),
-            output_hidden_states=True,
+            text_input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=False
         )
 
         # We are only ALWAYS interested in the pooled output of the final text encoder
         pooled_prompt_embeds = prompt_embeds[0]
-        prompt_embeds = prompt_embeds.hidden_states[-2]
+        prompt_embeds = prompt_embeds[-1][-2]
         bs_embed, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
         prompt_embeds_list.append(prompt_embeds)
@@ -491,12 +480,13 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
     )
 
     if args.report_to == "wandb":
@@ -536,10 +526,16 @@ def main(args):
 
     # Load the tokenizers
     tokenizer_one = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, use_fast=False
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+        use_fast=False,
     )
     tokenizer_two = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=args.revision, use_fast=False
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+        revision=args.revision,
+        use_fast=False,
     )
 
     # import correct text encoder classes
@@ -553,10 +549,10 @@ def main(args):
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder_one = text_encoder_cls_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
     text_encoder_two = text_encoder_cls_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
     vae_path = (
         args.pretrained_model_name_or_path
@@ -564,10 +560,13 @@ def main(args):
         else args.pretrained_vae_model_name_or_path
     )
     vae = AutoencoderKL.from_pretrained(
-        vae_path, subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None, revision=args.revision
+        vae_path,
+        subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+        revision=args.revision,
+        variant=args.variant,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
     # We only train the additional adapter LoRA layers
@@ -609,40 +608,39 @@ def main(args):
 
     # now we will add new LoRA weights to the attention layers
     # Set correct lora layers
-    unet_lora_attn_procs = {}
-    unet_lora_parameters = []
-    for name, attn_processor in unet.attn_processors.items():
-        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
+    unet_lora_config = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
 
-        lora_attn_processor_class = (
-            LoRAAttnProcessor2_0 if hasattr(F, "scaled_dot_product_attention") else LoRAAttnProcessor
-        )
-        module = lora_attn_processor_class(
-            hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=args.rank
-        )
-        unet_lora_attn_procs[name] = module
-        unet_lora_parameters.extend(module.parameters())
+    unet.add_adapter(unet_lora_config)
 
-    unet.set_attn_processor(unet_lora_attn_procs)
-
-    # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
-    # So, instead, we monkey-patch the forward calls of its attention-blocks.
+    # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
     if args.train_text_encoder:
         # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
-        text_lora_parameters_one = LoraLoaderMixin._modify_text_encoder(
-            text_encoder_one, dtype=torch.float32, rank=args.rank
+        text_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         )
-        text_lora_parameters_two = LoraLoaderMixin._modify_text_encoder(
-            text_encoder_two, dtype=torch.float32, rank=args.rank
-        )
+        text_encoder_one.add_adapter(text_lora_config)
+        text_encoder_two.add_adapter(text_lora_config)
+
+    # Make sure the trainable params are in float32.
+    if args.mixed_precision == "fp16":
+        models = [unet]
+        if args.train_text_encoder:
+            models.extend([text_encoder_one, text_encoder_two])
+            # only upcast trainable parameters (LoRA) into fp32
+            cast_training_params(models, dtype=torch.float32)
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -654,17 +652,22 @@ def main(args):
             text_encoder_two_lora_layers_to_save = None
 
             for model in models:
-                if isinstance(model, type(accelerator.unwrap_model(unet))):
-                    unet_lora_layers_to_save = unet_attn_processors_state_dict(model)
-                elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
-                    text_encoder_one_lora_layers_to_save = text_encoder_lora_state_dict(model)
-                elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
-                    text_encoder_two_lora_layers_to_save = text_encoder_lora_state_dict(model)
+                if isinstance(unwrap_model(model), type(unwrap_model(unet))):
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(unwrap_model(model), type(unwrap_model(text_encoder_one))):
+                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                elif isinstance(unwrap_model(model), type(unwrap_model(text_encoder_two))):
+                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
                 # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+                if weights:
+                    weights.pop()
 
             StableDiffusionXLPipeline.save_lora_weights(
                 output_dir,
@@ -681,11 +684,11 @@ def main(args):
         while len(models) > 0:
             model = models.pop()
 
-            if isinstance(model, type(accelerator.unwrap_model(unet))):
+            if isinstance(model, type(unwrap_model(unet))):
                 unet_ = model
-            elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
+            elif isinstance(model, type(unwrap_model(text_encoder_one))):
                 text_encoder_one_ = model
-            elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
+            elif isinstance(model, type(unwrap_model(text_encoder_two))):
                 text_encoder_two_ = model
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
@@ -705,6 +708,12 @@ def main(args):
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder_one.gradient_checkpointing_enable()
+            text_encoder_two.gradient_checkpointing_enable()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -730,11 +739,13 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = (
-        itertools.chain(unet_lora_parameters, text_lora_parameters_one, text_lora_parameters_two)
-        if args.train_text_encoder
-        else unet_lora_parameters
-    )
+    params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    if args.train_text_encoder:
+        params_to_optimize = (
+            params_to_optimize
+            + list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
+            + list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
+        )
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -751,9 +762,7 @@ def main(args):
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
+            args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir
         )
     else:
         data_files = {}
@@ -828,6 +837,9 @@ def main(args):
         for image in images:
             original_sizes.append((image.height, image.width))
             image = train_resize(image)
+            if args.random_flip and random.random() < 0.5:
+                # flip
+                image = train_flip(image)
             if args.center_crop:
                 y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
                 x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
@@ -835,10 +847,6 @@ def main(args):
             else:
                 y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
                 image = crop(image, y1, x1, h, w)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                x1 = image.width - x1
-                image = train_flip(image)
             crop_top_left = (y1, x1)
             crop_top_lefts.append(crop_top_left)
             image = train_transforms(image)
@@ -947,18 +955,25 @@ def main(args):
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
+            initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
-            resume_global_step = global_step * args.gradient_accumulation_steps
+            initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
+    else:
+        initial_global_step = 0
+
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -967,12 +982,6 @@ def main(args):
             text_encoder_two.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
-
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 if args.pretrained_vae_model_name_or_path is not None:
@@ -1027,8 +1036,12 @@ def main(args):
                 )
                 unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
                 model_pred = unet(
-                    noisy_model_input, timesteps, prompt_embeds, added_cond_kwargs=unet_added_conditions
-                ).sample
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    added_cond_kwargs=unet_added_conditions,
+                    return_dict=False,
+                )[0]
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -1049,25 +1062,13 @@ def main(args):
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
                     snr = compute_snr(noise_scheduler, timesteps)
-                    base_weight = (
+                    if noise_scheduler.config.prediction_type == "v_prediction":
+                        # Velocity objective requires that we add one to SNR values before we divide by them.
+                        snr = snr + 1
+                    mse_loss_weights = (
                         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
                     )
 
-                    if noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective needs to be floored to an SNR weight of one.
-                        mse_loss_weights = base_weight + 1
-                    else:
-                        # Epsilon and sample both use the same loss weights.
-                        mse_loss_weights = base_weight
-
-                    # For zero-terminal SNR, we have to handle the case where a sigma of Zero results in a Inf value.
-                    # When we run this, the MSE loss weights for this timestep is set unconditionally to 1.
-                    # If we do not run this, the loss value will go to NaN almost immediately, usually within one step.
-                    mse_loss_weights[snr == 0] = 1.0
-
-                    # We first calculate the original loss. Then we mean over the non-batch dimensions and
-                    # rebalance the sample-wise losses with their respective loss weights.
-                    # Finally, we take the mean of the rebalanced loss.
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
@@ -1079,12 +1080,7 @@ def main(args):
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet_lora_parameters, text_lora_parameters_one, text_lora_parameters_two)
-                        if args.train_text_encoder
-                        else unet_lora_parameters
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1138,10 +1134,11 @@ def main(args):
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    unet=accelerator.unwrap_model(unet),
+                    text_encoder=unwrap_model(text_encoder_one),
+                    text_encoder_2=unwrap_model(text_encoder_two),
+                    unet=unwrap_model(unet),
                     revision=args.revision,
+                    variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
 
@@ -1178,21 +1175,22 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        unet_lora_layers = unet_attn_processors_state_dict(unet)
+        unet = unwrap_model(unet)
+        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
 
         if args.train_text_encoder:
-            text_encoder_one = accelerator.unwrap_model(text_encoder_one)
-            text_encoder_lora_layers = text_encoder_lora_state_dict(text_encoder_one)
-            text_encoder_two = accelerator.unwrap_model(text_encoder_two)
-            text_encoder_2_lora_layers = text_encoder_lora_state_dict(text_encoder_two)
+            text_encoder_one = unwrap_model(text_encoder_one)
+            text_encoder_two = unwrap_model(text_encoder_two)
+
+            text_encoder_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_one))
+            text_encoder_2_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_two))
         else:
             text_encoder_lora_layers = None
             text_encoder_2_lora_layers = None
 
         StableDiffusionXLPipeline.save_lora_weights(
             save_directory=args.output_dir,
-            unet_lora_layers=unet_lora_layers,
+            unet_lora_layers=unet_lora_state_dict,
             text_encoder_lora_layers=text_encoder_lora_layers,
             text_encoder_2_lora_layers=text_encoder_2_lora_layers,
         )
@@ -1205,9 +1203,16 @@ def main(args):
         torch.cuda.empty_cache()
 
         # Final inference
+        # Make sure vae.dtype is consistent with the unet.dtype
+        if args.mixed_precision == "fp16":
+            vae.to(weight_dtype)
         # Load previous pipeline
         pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.pretrained_model_name_or_path, vae=vae, revision=args.revision, torch_dtype=weight_dtype
+            args.pretrained_model_name_or_path,
+            vae=vae,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
         )
         pipeline = pipeline.to(accelerator.device)
 

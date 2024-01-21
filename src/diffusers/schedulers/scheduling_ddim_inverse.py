@@ -204,9 +204,7 @@ class DDIMInverseScheduler(SchedulerMixin, ConfigMixin):
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = (
-                torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
-            )
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
@@ -288,9 +286,6 @@ class DDIMInverseScheduler(SchedulerMixin, ConfigMixin):
                 f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'leading' or 'trailing'."
             )
 
-        # Roll timesteps array by one to reflect reversed origin and destination semantics for each step
-        timesteps = np.roll(timesteps, 1)
-        timesteps[0] = int(timesteps[1] - step_ratio)
         self.timesteps = torch.from_numpy(timesteps).to(device)
 
     def step(
@@ -298,9 +293,6 @@ class DDIMInverseScheduler(SchedulerMixin, ConfigMixin):
         model_output: torch.FloatTensor,
         timestep: int,
         sample: torch.FloatTensor,
-        eta: float = 0.0,
-        use_clipped_model_output: bool = False,
-        variance_noise: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
     ) -> Union[DDIMSchedulerOutput, Tuple]:
         """
@@ -335,7 +327,10 @@ class DDIMInverseScheduler(SchedulerMixin, ConfigMixin):
 
         """
         # 1. get previous step value (=t+1)
-        prev_timestep = timestep + self.config.num_train_timesteps // self.num_inference_steps
+        prev_timestep = timestep
+        timestep = min(
+            timestep - self.config.num_train_timesteps // self.num_inference_steps, self.config.num_train_timesteps - 1
+        )
 
         # 2. compute alphas, betas
         # change original implementation to exactly match noise levels for analogous forward process

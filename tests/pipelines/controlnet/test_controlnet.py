@@ -27,6 +27,7 @@ from diffusers import (
     ControlNetModel,
     DDIMScheduler,
     EulerDiscreteScheduler,
+    LCMScheduler,
     StableDiffusionControlNetPipeline,
     UNet2DConditionModel,
 )
@@ -85,16 +86,17 @@ def _test_stable_diffusion_compile(in_queue, out_queue, timeout):
         prompt = "bird"
         image = load_image(
             "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/bird_canny.png"
-        )
+        ).resize((512, 512))
 
-        output = pipe(prompt, image, generator=generator, output_type="np")
+        output = pipe(prompt, image, num_inference_steps=10, generator=generator, output_type="np")
         image = output.images[0]
 
-        assert image.shape == (768, 512, 3)
+        assert image.shape == (512, 512, 3)
 
         expected_image = load_numpy(
             "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/bird_canny_out_full.npy"
         )
+        expected_image = np.resize(expected_image, (512, 512, 3))
 
         assert np.abs(expected_image - image).max() < 1.0
 
@@ -115,10 +117,10 @@ class ControlNetPipelineFastTests(
     image_params = IMAGE_TO_IMAGE_IMAGE_PARAMS
     image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
 
-    def get_dummy_components(self):
+    def get_dummy_components(self, time_cond_proj_dim=None):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             sample_size=32,
             in_channels=4,
@@ -126,15 +128,18 @@ class ControlNetPipelineFastTests(
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
+            norm_num_groups=1,
+            time_cond_proj_dim=time_cond_proj_dim,
         )
         torch.manual_seed(0)
         controlnet = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
         scheduler = DDIMScheduler(
@@ -146,12 +151,13 @@ class ControlNetPipelineFastTests(
         )
         torch.manual_seed(0)
         vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+            block_out_channels=[4, 8],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
+            norm_num_groups=2,
         )
         torch.manual_seed(0)
         text_encoder_config = CLIPTextConfig(
@@ -177,6 +183,7 @@ class ControlNetPipelineFastTests(
             "tokenizer": tokenizer,
             "safety_checker": None,
             "feature_extractor": None,
+            "image_encoder": None,
         }
         return components
 
@@ -217,6 +224,52 @@ class ControlNetPipelineFastTests(
     def test_inference_batch_single_identical(self):
         self._test_inference_batch_single_identical(expected_max_diff=2e-3)
 
+    def test_controlnet_lcm(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        sd_pipe = StableDiffusionControlNetPipeline(**components)
+        sd_pipe.scheduler = LCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(torch_device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        output = sd_pipe(**inputs)
+        image = output.images
+
+        image_slice = image[0, -3:, -3:, -1]
+
+        assert image.shape == (1, 64, 64, 3)
+        expected_slice = np.array(
+            [0.52700454, 0.3930534, 0.25509018, 0.7132304, 0.53696585, 0.46568912, 0.7095368, 0.7059624, 0.4744786]
+        )
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+
+    def test_controlnet_lcm_custom_timesteps(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        sd_pipe = StableDiffusionControlNetPipeline(**components)
+        sd_pipe.scheduler = LCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(torch_device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        del inputs["num_inference_steps"]
+        inputs["timesteps"] = [999, 499]
+        output = sd_pipe(**inputs)
+        image = output.images
+
+        image_slice = image[0, -3:, -3:, -1]
+
+        assert image.shape == (1, 64, 64, 3)
+        expected_slice = np.array(
+            [0.52700454, 0.3930534, 0.25509018, 0.7132304, 0.53696585, 0.46568912, 0.7095368, 0.7059624, 0.4744786]
+        )
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+
 
 class StableDiffusionMultiControlNetPipelineFastTests(
     PipelineTesterMixin, PipelineKarrasSchedulerTesterMixin, unittest.TestCase
@@ -229,7 +282,7 @@ class StableDiffusionMultiControlNetPipelineFastTests(
     def get_dummy_components(self):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             sample_size=32,
             in_channels=4,
@@ -237,6 +290,7 @@ class StableDiffusionMultiControlNetPipelineFastTests(
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
 
@@ -246,23 +300,25 @@ class StableDiffusionMultiControlNetPipelineFastTests(
                 m.bias.data.fill_(1.0)
 
         controlnet1 = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         controlnet1.controlnet_down_blocks.apply(init_weights)
 
         torch.manual_seed(0)
         controlnet2 = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         controlnet2.controlnet_down_blocks.apply(init_weights)
 
@@ -276,12 +332,13 @@ class StableDiffusionMultiControlNetPipelineFastTests(
         )
         torch.manual_seed(0)
         vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+            block_out_channels=[4, 8],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
+            norm_num_groups=2,
         )
         torch.manual_seed(0)
         text_encoder_config = CLIPTextConfig(
@@ -309,6 +366,7 @@ class StableDiffusionMultiControlNetPipelineFastTests(
             "tokenizer": tokenizer,
             "safety_checker": None,
             "feature_extractor": None,
+            "image_encoder": None,
         }
         return components
 
@@ -402,6 +460,33 @@ class StableDiffusionMultiControlNetPipelineFastTests(
             except NotImplementedError:
                 pass
 
+    def test_inference_multiple_prompt_input(self):
+        device = "cpu"
+
+        components = self.get_dummy_components()
+        sd_pipe = StableDiffusionControlNetPipeline(**components)
+        sd_pipe = sd_pipe.to(torch_device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        inputs["prompt"] = [inputs["prompt"], inputs["prompt"]]
+        inputs["image"] = [inputs["image"], inputs["image"]]
+        output = sd_pipe(**inputs)
+        image = output.images
+
+        assert image.shape == (2, 64, 64, 3)
+
+        image_1, image_2 = image
+        # make sure that the outputs are different
+        assert np.sum(np.abs(image_1 - image_2)) > 1e-3
+
+        # multiple prompts, single image conditioning
+        inputs = self.get_dummy_inputs(device)
+        inputs["prompt"] = [inputs["prompt"], inputs["prompt"]]
+        output_1 = sd_pipe(**inputs)
+
+        assert np.abs(image - output_1.images).max() < 1e-3
+
 
 class StableDiffusionMultiControlNetOneModelPipelineFastTests(
     PipelineTesterMixin, PipelineKarrasSchedulerTesterMixin, unittest.TestCase
@@ -414,7 +499,7 @@ class StableDiffusionMultiControlNetOneModelPipelineFastTests(
     def get_dummy_components(self):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             sample_size=32,
             in_channels=4,
@@ -422,6 +507,7 @@ class StableDiffusionMultiControlNetOneModelPipelineFastTests(
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
 
@@ -431,12 +517,13 @@ class StableDiffusionMultiControlNetOneModelPipelineFastTests(
                 m.bias.data.fill_(1.0)
 
         controlnet = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         controlnet.controlnet_down_blocks.apply(init_weights)
 
@@ -450,12 +537,13 @@ class StableDiffusionMultiControlNetOneModelPipelineFastTests(
         )
         torch.manual_seed(0)
         vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+            block_out_channels=[4, 8],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
+            norm_num_groups=2,
         )
         torch.manual_seed(0)
         text_encoder_config = CLIPTextConfig(
@@ -483,6 +571,7 @@ class StableDiffusionMultiControlNetOneModelPipelineFastTests(
             "tokenizer": tokenizer,
             "safety_checker": None,
             "feature_extractor": None,
+            "image_encoder": None,
         }
         return components
 

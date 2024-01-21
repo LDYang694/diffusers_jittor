@@ -21,14 +21,15 @@ from .. import __version__
 from .constants import (
     CONFIG_NAME,
     DEPRECATED_REVISION_ARGS,
-    DIFFUSERS_CACHE,
     DIFFUSERS_DYNAMIC_MODULE_NAME,
     FLAX_WEIGHTS_NAME,
     HF_MODULES_CACHE,
     HUGGINGFACE_CO_RESOLVE_ENDPOINT,
+    MIN_PEFT_VERSION,
     ONNX_EXTERNAL_WEIGHTS_NAME,
     ONNX_WEIGHTS_NAME,
     SAFETENSORS_WEIGHTS_NAME,
+    USE_PEFT_BACKEND,
     WEIGHTS_NAME,
 )
 from .deprecation_utils import deprecate
@@ -36,7 +37,6 @@ from .doc_utils import replace_example_docstring
 from .dynamic_modules_utils import get_class_from_dynamic_module
 from .export_utils import export_to_gif, export_to_obj, export_to_ply, export_to_video
 from .hub_utils import (
-    HF_HUB_OFFLINE,
     PushToHubMixin,
     _add_variant,
     _get_model_file,
@@ -66,13 +66,13 @@ from .import_utils import (
     is_k_diffusion_version,
     is_librosa_available,
     is_note_seq_available,
-    is_omegaconf_available,
     is_onnx_available,
     is_peft_available,
     is_scipy_available,
     is_tensorboard_available,
     is_torch_available,
     is_torch_version,
+    is_torch_xla_available,
     is_torchsde_available,
     is_transformers_available,
     is_transformers_version,
@@ -85,15 +85,24 @@ from .loading_utils import load_image
 from .logging import get_logger
 from .outputs import BaseOutput
 from .peft_utils import (
+    check_peft_version,
+    delete_adapter_layers,
     get_adapter_name,
     get_peft_kwargs,
     recurse_remove_peft_layers,
     scale_lora_layers,
     set_adapter_layers,
     set_weights_and_activate_adapters,
+    unscale_lora_layers,
 )
 from .pil_utils import PIL_INTERPOLATION, make_image_grid, numpy_to_pil, pt_to_pil
-from .state_dict_utils import convert_state_dict_to_diffusers, convert_state_dict_to_peft
+from .state_dict_utils import (
+    convert_all_state_dict_to_peft,
+    convert_state_dict_to_diffusers,
+    convert_state_dict_to_kohya,
+    convert_state_dict_to_peft,
+    convert_unet_state_dict_to_peft,
+)
 
 
 logger = get_logger(__name__)

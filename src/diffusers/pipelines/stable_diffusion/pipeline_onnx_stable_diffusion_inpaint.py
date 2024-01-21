@@ -80,6 +80,7 @@ class OnnxStableDiffusionInpaintPipeline(DiffusionPipeline):
         feature_extractor ([`CLIPImageProcessor`]):
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
+
     vae_encoder: OnnxRuntimeModel
     vae_decoder: OnnxRuntimeModel
     text_encoder: OnnxRuntimeModel
@@ -524,7 +525,8 @@ class OnnxStableDiffusionInpaintPipeline(DiffusionPipeline):
 
             # call the callback, if provided
             if callback is not None and i % callback_steps == 0:
-                callback(i, t, latents)
+                step_idx = i // getattr(self.scheduler, "order", 1)
+                callback(step_idx, t, latents)
 
         latents = 1 / 0.18215 * latents
         # image = self.vae_decoder(latent_sample=latents)[0]

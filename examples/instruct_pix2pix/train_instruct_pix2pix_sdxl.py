@@ -52,10 +52,14 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_instru
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, load_image
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 
+
+if is_wandb_available():
+    import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.22.0.dev0")
+check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -64,6 +68,57 @@ DATASET_NAME_MAPPING = {
 }
 WANDB_TABLE_COL_NAMES = ["file_name", "edited_image", "edit_prompt"]
 TORCH_DTYPE_MAPPING = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def log_validation(
+    pipeline,
+    args,
+    accelerator,
+    generator,
+    global_step,
+    is_final_validation=False,
+):
+    logger.info(
+        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        f" {args.validation_prompt}."
+    )
+
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    val_save_dir = os.path.join(args.output_dir, "validation_images")
+    if not os.path.exists(val_save_dir):
+        os.makedirs(val_save_dir)
+
+    original_image = (
+        lambda image_url_or_path: load_image(image_url_or_path)
+        if urlparse(image_url_or_path).scheme
+        else Image.open(image_url_or_path).convert("RGB")
+    )(args.val_image_url_or_path)
+
+    with torch.autocast(str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"):
+        edited_images = []
+        # Run inference
+        for val_img_idx in range(args.num_validation_images):
+            a_val_img = pipeline(
+                args.validation_prompt,
+                image=original_image,
+                num_inference_steps=20,
+                image_guidance_scale=1.5,
+                guidance_scale=7,
+                generator=generator,
+            ).images[0]
+            edited_images.append(a_val_img)
+            # Save validation images
+            a_val_img.save(os.path.join(val_save_dir, f"step_{global_step}_val_img_{val_img_idx}.png"))
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
+            for edited_image in edited_images:
+                wandb_table.add_data(wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt)
+            logger_name = "test" if is_final_validation else "validation"
+            tracker.log({logger_name: wandb_table})
 
 
 def import_model_class_from_model_name_or_path(
@@ -117,6 +172,12 @@ def parse_args():
         default=None,
         required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
         "--dataset_name",
@@ -440,11 +501,6 @@ def main():
 
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if args.report_to == "wandb":
-        if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-        import wandb
-
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -484,9 +540,10 @@ def main():
         vae_path,
         subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
         revision=args.revision,
+        variant=args.variant,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
     # InstructPix2Pix uses an additional image for conditioning. To accommodate that,
@@ -523,6 +580,11 @@ def main():
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -695,10 +757,16 @@ def main():
 
     # Load scheduler, tokenizer and models.
     tokenizer_1 = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, use_fast=False
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+        use_fast=False,
     )
     tokenizer_2 = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=args.revision, use_fast=False
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+        revision=args.revision,
+        use_fast=False,
     )
     text_encoder_cls_1 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
     text_encoder_cls_2 = import_model_class_from_model_name_or_path(
@@ -708,10 +776,10 @@ def main():
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder_1 = text_encoder_cls_1.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
     text_encoder_2 = text_encoder_cls_2.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
 
     # We ALWAYS pre-compute the additional condition embeddings needed for SDXL
@@ -725,6 +793,9 @@ def main():
     vae.requires_grad_(False)
     text_encoder_1.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
+
+    # Set UNet to trainable.
+    unet.train()
 
     # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
     def encode_prompt(text_encoders, tokenizers, prompt):
@@ -933,29 +1004,28 @@ def main():
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
+            initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
-            resume_global_step = global_step * args.gradient_accumulation_steps
+            initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+    else:
+        initial_global_step = 0
 
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine.
+        disable=not accelerator.is_local_main_process,
+    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
-
             with accelerator.accumulate(unet):
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
@@ -1029,8 +1099,12 @@ def main():
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
                 model_pred = unet(
-                    concatenated_noisy_latents, timesteps, encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
-                ).sample
+                    concatenated_noisy_latents,
+                    timesteps,
+                    encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False,
+                )[0]
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -1084,13 +1158,8 @@ def main():
             progress_bar.set_postfix(**logs)
 
             ### BEGIN: Perform validation every `validation_epochs` steps
-            if global_step % args.validation_steps == 0 or global_step == 1:
+            if global_step % args.validation_steps == 0:
                 if (args.val_image_url_or_path is not None) and (args.validation_prompt is not None):
-                    logger.info(
-                        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                        f" {args.validation_prompt}."
-                    )
-
                     # create pipeline
                     if args.use_ema:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
@@ -1100,53 +1169,26 @@ def main():
                     # The models need unwrapping because for compatibility in distributed training mode.
                     pipeline = StableDiffusionXLInstructPix2PixPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
-                        unet=accelerator.unwrap_model(unet),
+                        unet=unwrap_model(unet),
                         text_encoder=text_encoder_1,
                         text_encoder_2=text_encoder_2,
                         tokenizer=tokenizer_1,
                         tokenizer_2=tokenizer_2,
                         vae=vae,
                         revision=args.revision,
+                        variant=args.variant,
                         torch_dtype=weight_dtype,
                     )
-                    pipeline = pipeline.to(accelerator.device)
-                    pipeline.set_progress_bar_config(disable=True)
 
-                    # run inference
-                    # Save validation images
-                    val_save_dir = os.path.join(args.output_dir, "validation_images")
-                    if not os.path.exists(val_save_dir):
-                        os.makedirs(val_save_dir)
+                    log_validation(
+                        pipeline,
+                        args,
+                        accelerator,
+                        generator,
+                        global_step,
+                        is_final_validation=False,
+                    )
 
-                    original_image = (
-                        lambda image_url_or_path: load_image(image_url_or_path)
-                        if urlparse(image_url_or_path).scheme
-                        else Image.open(image_url_or_path).convert("RGB")
-                    )(args.val_image_url_or_path)
-                    with torch.autocast(
-                        str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
-                    ):
-                        edited_images = []
-                        for val_img_idx in range(args.num_validation_images):
-                            a_val_img = pipeline(
-                                args.validation_prompt,
-                                image=original_image,
-                                num_inference_steps=20,
-                                image_guidance_scale=1.5,
-                                guidance_scale=7,
-                                generator=generator,
-                            ).images[0]
-                            edited_images.append(a_val_img)
-                            a_val_img.save(os.path.join(val_save_dir, f"step_{global_step}_val_img_{val_img_idx}.png"))
-
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "wandb":
-                            wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-                            for edited_image in edited_images:
-                                wandb_table.add_data(
-                                    wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt
-                                )
-                            tracker.log({"validation": wandb_table})
                     if args.use_ema:
                         # Switch back to the original UNet parameters.
                         ema_unet.restore(unet.parameters())
@@ -1161,7 +1203,6 @@ def main():
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
@@ -1172,9 +1213,11 @@ def main():
             tokenizer=tokenizer_1,
             tokenizer_2=tokenizer_2,
             vae=vae,
-            unet=unet,
+            unet=unwrap_model(unet),
             revision=args.revision,
+            variant=args.variant,
         )
+
         pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
@@ -1185,30 +1228,15 @@ def main():
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
-        if args.validation_prompt is not None:
-            edited_images = []
-            pipeline = pipeline.to(accelerator.device)
-            with torch.autocast(str(accelerator.device).replace(":0", "")):
-                for _ in range(args.num_validation_images):
-                    edited_images.append(
-                        pipeline(
-                            args.validation_prompt,
-                            image=original_image,
-                            num_inference_steps=20,
-                            image_guidance_scale=1.5,
-                            guidance_scale=7,
-                            generator=generator,
-                        ).images[0]
-                    )
-
-            for tracker in accelerator.trackers:
-                if tracker.name == "wandb":
-                    wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-                    for edited_image in edited_images:
-                        wandb_table.add_data(
-                            wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt
-                        )
-                    tracker.log({"test": wandb_table})
+        if (args.val_image_url_or_path is not None) and (args.validation_prompt is not None):
+            log_validation(
+                pipeline,
+                args,
+                accelerator,
+                generator,
+                global_step,
+                is_final_validation=True,
+            )
 
     accelerator.end_training()
 

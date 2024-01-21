@@ -170,6 +170,7 @@ class StableDiffusionRepaintPipeline(DiffusionPipeline, TextualInversionLoaderMi
         feature_extractor ([`CLIPImageProcessor`]):
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
+
     _optional_components = ["safety_checker", "feature_extractor"]
 
     def __init__(
@@ -932,7 +933,8 @@ class StableDiffusionRepaintPipeline(DiffusionPipeline, TextualInversionLoaderMi
                 # call the callback, if provided
                 progress_bar.update()
                 if callback is not None and i % callback_steps == 0:
-                    callback(i, t, latents)
+                    step_idx = i // getattr(self.scheduler, "order", 1)
+                    callback(step_idx, t, latents)
 
                 t_last = t
 

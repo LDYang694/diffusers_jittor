@@ -94,6 +94,7 @@ class Zero1to3StableDiffusionPipeline(DiffusionPipeline):
         cc_projection ([`CCProjection`]):
             Projection layer to project the concated CLIP features and pose embeddings to the original CLIP feature size.
     """
+
     _optional_components = ["safety_checker", "feature_extractor"]
 
     def __init__(
@@ -658,7 +659,8 @@ class Zero1to3StableDiffusionPipeline(DiffusionPipeline):
 
         if isinstance(generator, list):
             init_latents = [
-                self.vae.encode(image[i : i + 1]).latent_dist.mode(generator[i]) for i in range(batch_size)  # sample
+                self.vae.encode(image[i : i + 1]).latent_dist.mode(generator[i])
+                for i in range(batch_size)  # sample
             ]
             init_latents = torch.cat(init_latents, dim=0)
         else:
@@ -865,7 +867,8 @@ class Zero1to3StableDiffusionPipeline(DiffusionPipeline):
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
 
         # 8. Post-processing
         has_nsfw_concept = None

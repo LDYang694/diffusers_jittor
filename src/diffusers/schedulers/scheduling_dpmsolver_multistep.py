@@ -117,9 +117,20 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         lower_order_final (`bool`, defaults to `True`):
             Whether to use lower-order solvers in the final steps. Only valid for < 15 inference steps. This can
             stabilize the sampling of DPMSolver for steps < 15, especially for steps <= 10.
+        euler_at_final (`bool`, defaults to `False`):
+            Whether to use Euler's method in the final step. It is a trade-off between numerical stability and detail
+            richness. This can stabilize the sampling of the SDE variant of DPMSolver for small number of inference
+            steps, but sometimes may result in blurring.
         use_karras_sigmas (`bool`, *optional*, defaults to `False`):
             Whether to use Karras sigmas for step sizes in the noise schedule during the sampling process. If `True`,
             the sigmas are determined according to a sequence of noise levels {σi}.
+        use_lu_lambdas (`bool`, *optional*, defaults to `False`):
+            Whether to use the uniform-logSNR for step sizes proposed by Lu's DPM-Solver in the noise schedule during
+            the sampling process. If `True`, the sigmas and time steps are determined according to a sequence of
+            `lambda(t)`.
+        final_sigmas_type (`str`, defaults to `"zero"`):
+            The final `sigma` value for the noise schedule during the sampling process. If `"sigma_min"`, the final sigma
+            is the same as the last sigma in the training schedule. If `zero`, the final sigma is set to 0.
         lambda_min_clipped (`float`, defaults to `-inf`):
             Clipping threshold for the minimum value of `lambda(t)` for numerical stability. This is critical for the
             cosine (`squaredcos_cap_v2`) noise schedule.
@@ -154,21 +165,26 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         algorithm_type: str = "dpmsolver++",
         solver_type: str = "midpoint",
         lower_order_final: bool = True,
+        euler_at_final: bool = False,
         use_karras_sigmas: Optional[bool] = False,
+        use_lu_lambdas: Optional[bool] = False,
+        final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
         lambda_min_clipped: float = -float("inf"),
         variance_type: Optional[str] = None,
         timestep_spacing: str = "linspace",
         steps_offset: int = 0,
     ):
+        if algorithm_type in ["dpmsolver", "sde-dpmsolver"]:
+            deprecation_message = f"algorithm_type {algorithm_type} is deprecated and will be removed in a future version. Choose from `dpmsolver++` or `sde-dpmsolver++` instead"
+            deprecate("algorithm_types dpmsolver and sde-dpmsolver", "1.0.0", deprecation_message)
+
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = (
-                torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
-            )
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
@@ -181,6 +197,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         self.alpha_t = torch.sqrt(self.alphas_cumprod)
         self.sigma_t = torch.sqrt(1 - self.alphas_cumprod)
         self.lambda_t = torch.log(self.alpha_t) - torch.log(self.sigma_t)
+        self.sigmas = ((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
@@ -198,6 +215,11 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             else:
                 raise NotImplementedError(f"{solver_type} does is not implemented for {self.__class__}")
 
+        if algorithm_type not in ["dpmsolver++", "sde-dpmsolver++"] and final_sigmas_type == "zero":
+            raise ValueError(
+                f"`final_sigmas_type` {final_sigmas_type} is not supported for `algorithm_type` {algorithm_type}. Please choose `sigma_min` instead."
+            )
+
         # setable values
         self.num_inference_steps = None
         timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=np.float32)[::-1].copy()
@@ -205,6 +227,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
         self._step_index = None
+        self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
 
     @property
     def step_index(self):
@@ -257,11 +280,24 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             sigmas = np.flip(sigmas).copy()
             sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
             timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]).round()
-            sigmas = np.concatenate([sigmas, sigmas[-1:]]).astype(np.float32)
+        elif self.config.use_lu_lambdas:
+            lambdas = np.flip(log_sigmas.copy())
+            lambdas = self._convert_to_lu(in_lambdas=lambdas, num_inference_steps=num_inference_steps)
+            sigmas = np.exp(lambdas)
+            timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]).round()
         else:
             sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
+
+        if self.config.final_sigmas_type == "sigma_min":
             sigma_last = ((1 - self.alphas_cumprod[0]) / self.alphas_cumprod[0]) ** 0.5
-            sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
+        elif self.config.final_sigmas_type == "zero":
+            sigma_last = 0
+        else:
+            raise ValueError(
+                f"`final_sigmas_type` must be one of 'zero', or 'sigma_min', but got {self.config.final_sigmas_type}"
+            )
+
+        sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
         self.sigmas = torch.from_numpy(sigmas)
         self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
@@ -275,6 +311,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
+        self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.FloatTensor) -> torch.FloatTensor:
@@ -288,13 +325,13 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         https://arxiv.org/abs/2205.11487
         """
         dtype = sample.dtype
-        batch_size, channels, height, width = sample.shape
+        batch_size, channels, *remaining_dims = sample.shape
 
         if dtype not in (torch.float32, torch.float64):
             sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
 
         # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * height * width)
+        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
 
         abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
 
@@ -302,11 +339,10 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         s = torch.clamp(
             s, min=1, max=self.config.sample_max_value
         )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-
         s = s.unsqueeze(1)  # (batch_size, 1) because clamp will broadcast along dim=0
         sample = torch.clamp(sample, -s, s) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
 
-        sample = sample.reshape(batch_size, channels, height, width)
+        sample = sample.reshape(batch_size, channels, *remaining_dims)
         sample = sample.to(dtype)
 
         return sample
@@ -314,7 +350,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
     # Copied from diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteScheduler._sigma_to_t
     def _sigma_to_t(self, sigma, log_sigmas):
         # get log sigma
-        log_sigma = np.log(sigma)
+        log_sigma = np.log(np.maximum(sigma, 1e-10))
 
         # get distribution
         dists = log_sigma - log_sigmas[:, np.newaxis]
@@ -345,8 +381,20 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
     def _convert_to_karras(self, in_sigmas: torch.FloatTensor, num_inference_steps) -> torch.FloatTensor:
         """Constructs the noise schedule of Karras et al. (2022)."""
 
-        sigma_min: float = in_sigmas[-1].item()
-        sigma_max: float = in_sigmas[0].item()
+        # Hack to make sure that other schedulers which copy this function don't break
+        # TODO: Add this logic to the other schedulers
+        if hasattr(self.config, "sigma_min"):
+            sigma_min = self.config.sigma_min
+        else:
+            sigma_min = None
+
+        if hasattr(self.config, "sigma_max"):
+            sigma_max = self.config.sigma_max
+        else:
+            sigma_max = None
+
+        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
+        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
 
         rho = 7.0  # 7.0 is the value used in the paper
         ramp = np.linspace(0, 1, num_inference_steps)
@@ -354,6 +402,19 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         max_inv_rho = sigma_max ** (1 / rho)
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
         return sigmas
+
+    def _convert_to_lu(self, in_lambdas: torch.FloatTensor, num_inference_steps) -> torch.FloatTensor:
+        """Constructs the noise schedule of Lu et al. (2022)."""
+
+        lambda_min: float = in_lambdas[-1].item()
+        lambda_max: float = in_lambdas[0].item()
+
+        rho = 1.0  # 1.0 is the value used in the paper
+        ramp = np.linspace(0, 1, num_inference_steps)
+        min_inv_rho = lambda_min ** (1 / rho)
+        max_inv_rho = lambda_max ** (1 / rho)
+        lambdas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+        return lambdas
 
     def convert_model_output(
         self,
@@ -788,8 +849,11 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         if self.step_index is None:
             self._init_step_index(timestep)
 
-        lower_order_final = (
-            (self.step_index == len(self.timesteps) - 1) and self.config.lower_order_final and len(self.timesteps) < 15
+        # Improve numerical stability for small number of steps
+        lower_order_final = (self.step_index == len(self.timesteps) - 1) and (
+            self.config.euler_at_final
+            or (self.config.lower_order_final and len(self.timesteps) < 15)
+            or self.config.final_sigmas_type == "zero"
         )
         lower_order_second = (
             (self.step_index == len(self.timesteps) - 2) and self.config.lower_order_final and len(self.timesteps) < 15
@@ -856,7 +920,16 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             schedule_timesteps = self.timesteps.to(original_samples.device)
             timesteps = timesteps.to(original_samples.device)
 
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        step_indices = []
+        for timestep in timesteps:
+            index_candidates = (schedule_timesteps == timestep).nonzero()
+            if len(index_candidates) == 0:
+                step_index = len(schedule_timesteps) - 1
+            elif len(index_candidates) > 1:
+                step_index = index_candidates[1].item()
+            else:
+                step_index = index_candidates[0].item()
+            step_indices.append(step_index)
 
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < len(original_samples.shape):

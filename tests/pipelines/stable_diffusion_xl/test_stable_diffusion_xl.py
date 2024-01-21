@@ -27,32 +27,49 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     EulerDiscreteScheduler,
     HeunDiscreteScheduler,
+    LCMScheduler,
     StableDiffusionXLImg2ImgPipeline,
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu, torch_device
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
+    load_image,
+    numpy_cosine_similarity_distance,
+    require_torch_gpu,
+    slow,
+    torch_device,
+)
 
-from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_IMAGE_PARAMS, TEXT_TO_IMAGE_PARAMS
-from ..test_pipelines_common import PipelineLatentTesterMixin, PipelineTesterMixin
+from ..pipeline_params import (
+    TEXT_TO_IMAGE_BATCH_PARAMS,
+    TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS,
+    TEXT_TO_IMAGE_IMAGE_PARAMS,
+    TEXT_TO_IMAGE_PARAMS,
+)
+from ..test_pipelines_common import PipelineLatentTesterMixin, PipelineTesterMixin, SDXLOptionalComponentsTesterMixin
 
 
 enable_full_determinism()
 
 
-class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTesterMixin, unittest.TestCase):
+class StableDiffusionXLPipelineFastTests(
+    PipelineLatentTesterMixin, PipelineTesterMixin, SDXLOptionalComponentsTesterMixin, unittest.TestCase
+):
     pipeline_class = StableDiffusionXLPipeline
     params = TEXT_TO_IMAGE_PARAMS
     batch_params = TEXT_TO_IMAGE_BATCH_PARAMS
     image_params = TEXT_TO_IMAGE_IMAGE_PARAMS
     image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
+    callback_cfg_params = TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS.union({"add_text_embeds", "add_time_ids"})
 
-    def get_dummy_components(self):
+    def get_dummy_components(self, time_cond_proj_dim=None):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(2, 4),
             layers_per_block=2,
+            time_cond_proj_dim=time_cond_proj_dim,
             sample_size=32,
             in_channels=4,
             out_channels=4,
@@ -66,6 +83,7 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
             transformer_layers_per_block=(1, 2),
             projection_class_embeddings_input_dim=80,  # 6 * 8 + 32
             cross_attention_dim=64,
+            norm_num_groups=1,
         )
         scheduler = EulerDiscreteScheduler(
             beta_start=0.00085,
@@ -113,8 +131,8 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
             "tokenizer": tokenizer,
             "text_encoder_2": text_encoder_2,
             "tokenizer_2": tokenizer_2,
-            # "safety_checker": None,
-            # "feature_extractor": None,
+            "image_encoder": None,
+            "feature_extractor": None,
         }
         return components
 
@@ -144,7 +162,43 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
         image_slice = image[0, -3:, -3:, -1]
 
         assert image.shape == (1, 64, 64, 3)
-        expected_slice = np.array([0.5873, 0.6128, 0.4797, 0.5122, 0.5674, 0.4639, 0.5227, 0.5149, 0.4747])
+        expected_slice = np.array([0.5552, 0.5569, 0.4725, 0.4348, 0.4994, 0.4632, 0.5142, 0.5012, 0.47])
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+
+    def test_stable_diffusion_xl_euler_lcm(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        sd_pipe = StableDiffusionXLPipeline(**components)
+        sd_pipe.scheduler = LCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        image = sd_pipe(**inputs).images
+        image_slice = image[0, -3:, -3:, -1]
+
+        assert image.shape == (1, 64, 64, 3)
+        expected_slice = np.array([0.4917, 0.6555, 0.4348, 0.5219, 0.7324, 0.4855, 0.5168, 0.5447, 0.5156])
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+
+    def test_stable_diffusion_xl_euler_lcm_custom_timesteps(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        sd_pipe = StableDiffusionXLPipeline(**components)
+        sd_pipe.scheduler = LCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        del inputs["num_inference_steps"]
+        inputs["timesteps"] = [999, 499]
+        image = sd_pipe(**inputs).images
+        image_slice = image[0, -3:, -3:, -1]
+
+        assert image.shape == (1, 64, 64, 3)
+        expected_slice = np.array([0.4917, 0.6555, 0.4348, 0.5219, 0.7324, 0.4855, 0.5168, 0.5447, 0.5156])
 
         assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
 
@@ -232,6 +286,9 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
     def test_inference_batch_single_identical(self):
         super().test_inference_batch_single_identical(expected_max_diff=3e-3)
 
+    def test_save_load_optional_components(self):
+        self._test_save_load_optional_components()
+
     @require_torch_gpu
     def test_stable_diffusion_xl_offloads(self):
         pipes = []
@@ -297,6 +354,107 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
         # make sure that it's equal
         assert np.abs(image_slice_1.flatten() - image_slice_2.flatten()).max() < 1e-4
 
+    def test_stable_diffusion_two_xl_mixture_of_denoiser_fast(self):
+        components = self.get_dummy_components()
+        pipe_1 = StableDiffusionXLPipeline(**components).to(torch_device)
+        pipe_1.unet.set_default_attn_processor()
+        pipe_2 = StableDiffusionXLImg2ImgPipeline(**components).to(torch_device)
+        pipe_2.unet.set_default_attn_processor()
+
+        def assert_run_mixture(
+            num_steps,
+            split,
+            scheduler_cls_orig,
+            expected_tss,
+            num_train_timesteps=pipe_1.scheduler.config.num_train_timesteps,
+        ):
+            inputs = self.get_dummy_inputs(torch_device)
+            inputs["num_inference_steps"] = num_steps
+
+            class scheduler_cls(scheduler_cls_orig):
+                pass
+
+            pipe_1.scheduler = scheduler_cls.from_config(pipe_1.scheduler.config)
+            pipe_2.scheduler = scheduler_cls.from_config(pipe_2.scheduler.config)
+
+            # Let's retrieve the number of timesteps we want to use
+            pipe_1.scheduler.set_timesteps(num_steps)
+            expected_steps = pipe_1.scheduler.timesteps.tolist()
+
+            if pipe_1.scheduler.order == 2:
+                expected_steps_1 = list(filter(lambda ts: ts >= split, expected_tss))
+                expected_steps_2 = expected_steps_1[-1:] + list(filter(lambda ts: ts < split, expected_tss))
+                expected_steps = expected_steps_1 + expected_steps_2
+            else:
+                expected_steps_1 = list(filter(lambda ts: ts >= split, expected_tss))
+                expected_steps_2 = list(filter(lambda ts: ts < split, expected_tss))
+
+            # now we monkey patch step `done_steps`
+            # list into the step function for testing
+            done_steps = []
+            old_step = copy.copy(scheduler_cls.step)
+
+            def new_step(self, *args, **kwargs):
+                done_steps.append(args[1].cpu().item())  # args[1] is always the passed `t`
+                return old_step(self, *args, **kwargs)
+
+            scheduler_cls.step = new_step
+
+            inputs_1 = {
+                **inputs,
+                **{
+                    "denoising_end": 1.0 - (split / num_train_timesteps),
+                    "output_type": "latent",
+                },
+            }
+            latents = pipe_1(**inputs_1).images[0]
+
+            assert expected_steps_1 == done_steps, f"Failure with {scheduler_cls.__name__} and {num_steps} and {split}"
+
+            inputs_2 = {
+                **inputs,
+                **{
+                    "denoising_start": 1.0 - (split / num_train_timesteps),
+                    "image": latents,
+                },
+            }
+            pipe_2(**inputs_2).images[0]
+
+            assert expected_steps_2 == done_steps[len(expected_steps_1) :]
+            assert expected_steps == done_steps, f"Failure with {scheduler_cls.__name__} and {num_steps} and {split}"
+
+        steps = 10
+        for split in [300, 700]:
+            for scheduler_cls_timesteps in [
+                (EulerDiscreteScheduler, [901, 801, 701, 601, 501, 401, 301, 201, 101, 1]),
+                (
+                    HeunDiscreteScheduler,
+                    [
+                        901.0,
+                        801.0,
+                        801.0,
+                        701.0,
+                        701.0,
+                        601.0,
+                        601.0,
+                        501.0,
+                        501.0,
+                        401.0,
+                        401.0,
+                        301.0,
+                        301.0,
+                        201.0,
+                        201.0,
+                        101.0,
+                        101.0,
+                        1.0,
+                        1.0,
+                    ],
+                ),
+            ]:
+                assert_run_mixture(steps, split, scheduler_cls_timesteps[0], scheduler_cls_timesteps[1])
+
+    @slow
     def test_stable_diffusion_two_xl_mixture_of_denoiser(self):
         components = self.get_dummy_components()
         pipe_1 = StableDiffusionXLPipeline(**components).to(torch_device)
@@ -324,8 +482,13 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
             pipe_1.scheduler.set_timesteps(num_steps)
             expected_steps = pipe_1.scheduler.timesteps.tolist()
 
-            expected_steps_1 = list(filter(lambda ts: ts >= split, expected_tss))
-            expected_steps_2 = list(filter(lambda ts: ts < split, expected_tss))
+            if pipe_1.scheduler.order == 2:
+                expected_steps_1 = list(filter(lambda ts: ts >= split, expected_tss))
+                expected_steps_2 = expected_steps_1[-1:] + list(filter(lambda ts: ts < split, expected_tss))
+                expected_steps = expected_steps_1 + expected_steps_2
+            else:
+                expected_steps_1 = list(filter(lambda ts: ts >= split, expected_tss))
+                expected_steps_2 = list(filter(lambda ts: ts < split, expected_tss))
 
             # now we monkey patch step `done_steps`
             # list into the step function for testing
@@ -575,6 +738,7 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
             ]:
                 assert_run_mixture(steps, split, scheduler_cls_timesteps[0], scheduler_cls_timesteps[1])
 
+    @slow
     def test_stable_diffusion_three_xl_mixture_of_denoiser(self):
         components = self.get_dummy_components()
         pipe_1 = StableDiffusionXLPipeline(**components).to(torch_device)
@@ -607,13 +771,18 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
 
             split_1_ts = num_train_timesteps - int(round(num_train_timesteps * split_1))
             split_2_ts = num_train_timesteps - int(round(num_train_timesteps * split_2))
-            expected_steps_1 = expected_steps[:split_1_ts]
-            expected_steps_2 = expected_steps[split_1_ts:split_2_ts]
-            expected_steps_3 = expected_steps[split_2_ts:]
 
-            expected_steps_1 = list(filter(lambda ts: ts >= split_1_ts, expected_steps))
-            expected_steps_2 = list(filter(lambda ts: ts >= split_2_ts and ts < split_1_ts, expected_steps))
-            expected_steps_3 = list(filter(lambda ts: ts < split_2_ts, expected_steps))
+            if pipe_1.scheduler.order == 2:
+                expected_steps_1 = list(filter(lambda ts: ts >= split_1_ts, expected_steps))
+                expected_steps_2 = expected_steps_1[-1:] + list(
+                    filter(lambda ts: ts >= split_2_ts and ts < split_1_ts, expected_steps)
+                )
+                expected_steps_3 = expected_steps_2[-1:] + list(filter(lambda ts: ts < split_2_ts, expected_steps))
+                expected_steps = expected_steps_1 + expected_steps_2 + expected_steps_3
+            else:
+                expected_steps_1 = list(filter(lambda ts: ts >= split_1_ts, expected_steps))
+                expected_steps_2 = list(filter(lambda ts: ts >= split_2_ts and ts < split_1_ts, expected_steps))
+                expected_steps_3 = list(filter(lambda ts: ts < split_2_ts, expected_steps))
 
             # now we monkey patch step `done_steps`
             # list into the step function for testing
@@ -768,3 +937,115 @@ class StableDiffusionXLPipelineFastTests(PipelineLatentTesterMixin, PipelineTest
             image_slices.append(image[0, -3:, -3:, -1].flatten())
 
         assert np.abs(image_slices[0] - image_slices[1]).max() < 1e-3
+
+    def test_stable_diffusion_xl_with_fused_qkv_projections(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+        components = self.get_dummy_components()
+        sd_pipe = StableDiffusionXLPipeline(**components)
+        sd_pipe = sd_pipe.to(device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        image = sd_pipe(**inputs).images
+        original_image_slice = image[0, -3:, -3:, -1]
+
+        sd_pipe.fuse_qkv_projections()
+        inputs = self.get_dummy_inputs(device)
+        image = sd_pipe(**inputs).images
+        image_slice_fused = image[0, -3:, -3:, -1]
+
+        sd_pipe.unfuse_qkv_projections()
+        inputs = self.get_dummy_inputs(device)
+        image = sd_pipe(**inputs).images
+        image_slice_disabled = image[0, -3:, -3:, -1]
+
+        assert np.allclose(
+            original_image_slice, image_slice_fused, atol=1e-2, rtol=1e-2
+        ), "Fusion of QKV projections shouldn't affect the outputs."
+        assert np.allclose(
+            image_slice_fused, image_slice_disabled, atol=1e-2, rtol=1e-2
+        ), "Outputs, with QKV projection fusion enabled, shouldn't change when fused QKV projections are disabled."
+        assert np.allclose(
+            original_image_slice, image_slice_disabled, atol=1e-2, rtol=1e-2
+        ), "Original outputs should match when fused QKV projections are disabled."
+
+    def test_pipeline_interrupt(self):
+        components = self.get_dummy_components()
+        sd_pipe = StableDiffusionXLPipeline(**components)
+        sd_pipe = sd_pipe.to(torch_device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        prompt = "hey"
+        num_inference_steps = 3
+
+        # store intermediate latents from the generation process
+        class PipelineState:
+            def __init__(self):
+                self.state = []
+
+            def apply(self, pipe, i, t, callback_kwargs):
+                self.state.append(callback_kwargs["latents"])
+                return callback_kwargs
+
+        pipe_state = PipelineState()
+        sd_pipe(
+            prompt,
+            num_inference_steps=num_inference_steps,
+            output_type="np",
+            generator=torch.Generator("cpu").manual_seed(0),
+            callback_on_step_end=pipe_state.apply,
+        ).images
+
+        # interrupt generation at step index
+        interrupt_step_idx = 1
+
+        def callback_on_step_end(pipe, i, t, callback_kwargs):
+            if i == interrupt_step_idx:
+                pipe._interrupt = True
+
+            return callback_kwargs
+
+        output_interrupted = sd_pipe(
+            prompt,
+            num_inference_steps=num_inference_steps,
+            output_type="latent",
+            generator=torch.Generator("cpu").manual_seed(0),
+            callback_on_step_end=callback_on_step_end,
+        ).images
+
+        # fetch intermediate latents at the interrupted step
+        # from the completed generation process
+        intermediate_latent = pipe_state.state[interrupt_step_idx]
+
+        # compare the intermediate latent to the output of the interrupted process
+        # they should be the same
+        assert torch.allclose(intermediate_latent, output_interrupted, atol=1e-4)
+
+
+@slow
+class StableDiffusionXLPipelineIntegrationTests(unittest.TestCase):
+    def test_stable_diffusion_lcm(self):
+        torch.manual_seed(0)
+        unet = UNet2DConditionModel.from_pretrained(
+            "latent-consistency/lcm-ssd-1b", torch_dtype=torch.float16, variant="fp16"
+        )
+        sd_pipe = StableDiffusionXLPipeline.from_pretrained(
+            "segmind/SSD-1B", unet=unet, torch_dtype=torch.float16, variant="fp16"
+        ).to(torch_device)
+        sd_pipe.scheduler = LCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        prompt = "a red car standing on the side of the street"
+
+        image = sd_pipe(prompt, num_inference_steps=4, guidance_scale=8.0).images[0]
+
+        expected_image = load_image(
+            "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/lcm_full/stable_diffusion_ssd_1b_lcm.png"
+        )
+
+        image = sd_pipe.image_processor.pil_to_numpy(image)
+        expected_image = sd_pipe.image_processor.pil_to_numpy(expected_image)
+
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), expected_image.flatten())
+
+        assert max_diff < 1e-2
