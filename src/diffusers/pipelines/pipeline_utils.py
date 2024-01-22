@@ -344,12 +344,28 @@ def get_class_obj_and_candidates(
         library = importlib.import_module(library_name)
 
         class_obj = getattr(library, class_name)
+        JDiffusion_has = check_JDiffusion_has_attr(library_name,class_name)
+        if library_name == 'diffusers' and JDiffusion_has:
+            library = importlib.import_module('JDiffusion')
         if library_name == 'JDiffusion':
             library = importlib.import_module('diffusers')
-        class_candidates = {c: getattr(library, c, None) for c in importable_classes.keys()}
+        if JDiffusion_has:
+            c_res = getattr(importlib.import_module('diffusers'), class_name, None)
+        else:
+            c_res = getattr(library, class_name, None)
+        class_candidates = {c: c_res for c in importable_classes.keys()}
 
     return class_obj, class_candidates
 
+def check_JDiffusion_has_attr(library_name,class_name):
+    try:
+        import JDiffusion
+        if hasattr(JDiffusion, class_name):
+            return True
+        else:
+            return False
+    except ModuleNotFoundError:
+        return False
 
 def _get_pipeline_class(
     class_obj,
