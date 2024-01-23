@@ -344,7 +344,7 @@ def get_class_obj_and_candidates(
         library = importlib.import_module(library_name)
 
         class_obj = getattr(library, class_name)
-        JDiffusion_has = check_JDiffusion_has_attr(library_name,class_name)
+        JDiffusion_has = check_JDiffusion_has_attr(class_name)
         if library_name == 'diffusers' and JDiffusion_has:
             library = importlib.import_module('JDiffusion')
         if library_name == 'JDiffusion':
@@ -357,7 +357,7 @@ def get_class_obj_and_candidates(
 
     return class_obj, class_candidates
 
-def check_JDiffusion_has_attr(library_name,class_name):
+def check_JDiffusion_has_attr(class_name):
     try:
         import JDiffusion
         if hasattr(JDiffusion, class_name):
@@ -409,7 +409,9 @@ def _get_pipeline_class(
     diffusers_module = importlib.import_module(class_obj.__module__.split(".")[0])
     class_name = config["_class_name"]
     class_name = class_name[4:] if class_name.startswith("Flax") else class_name
-
+    JD_has = check_JDiffusion_has_attr(class_name)
+    if JD_has:
+        diffusers_module = importlib.import_module('JDiffusion')
     pipeline_cls = getattr(diffusers_module, class_name)
 
     if load_connected_pipeline:

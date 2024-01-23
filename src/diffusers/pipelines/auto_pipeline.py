@@ -15,7 +15,7 @@
 
 import inspect
 from collections import OrderedDict
-
+import importlib
 from huggingface_hub.utils import validate_hf_hub_args
 
 from ..configuration_utils import ConfigMixin
@@ -58,7 +58,7 @@ from .stable_diffusion_xl import (
     StableDiffusionXLPipeline,
 )
 from .wuerstchen import WuerstchenCombinedPipeline, WuerstchenDecoderPipeline
-
+from .pipeline_utils import check_JDiffusion_has_attr
 
 AUTO_TEXT2IMAGE_PIPELINES_MAPPING = OrderedDict(
     [
@@ -152,11 +152,17 @@ def _get_task_class(mapping, pipeline_class_name, throw_error_if_not_exist: bool
             for model_name, pipeline in task_mapping.items():
                 if pipeline.__name__ == pipeline_class_name:
                     return model_name
-
     model_name = get_model(pipeline_class_name)
 
     if model_name is not None:
         task_class = mapping.get(model_name, None)
+        task_class_name = task_class.__name__
+        JD_has = check_JDiffusion_has_attr(task_class_name)
+        
+        if JD_has:
+            libary = importlib.import_module('JDiffusion')
+            task_class = getattr(libary, task_class_name)
+        
         if task_class is not None:
             return task_class
 
