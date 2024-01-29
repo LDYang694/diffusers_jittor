@@ -252,7 +252,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
 
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
-        print(in_channels, block_out_channels[0], conv_in_kernel, conv_in_padding)
+
         self.conv_in = nn.Conv2d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
@@ -376,7 +376,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
             )
-            print(down_block)
             self.down_blocks.append(down_block)
 
         # mid
@@ -1150,9 +1149,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
         t_emb = self.get_time_embed(sample=sample, timestep=timestep)
         emb = self.time_embedding(t_emb, timestep_cond)
         aug_emb = None
-        # xxxxxxx = torch.rand(100,100,100,100)
-        # xxxxxxx = xxxxxxx.numpy()
-        # print(xxxxxxx)
+
         class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)
 
         if class_emb is not None:
@@ -1177,9 +1174,9 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
         )
 
         # 2. pre-process
-        print(sample.shape)
+
         sample = self.conv_in(sample)
-        print(self.conv_in)
+
 
         # 2.5 GLIGEN position net
         if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
