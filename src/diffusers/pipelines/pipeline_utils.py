@@ -327,7 +327,7 @@ def get_class_obj_and_candidates(
 ):
     """Simple helper method to retrieve class object of module as well as potential parent class objects"""
     component_folder = os.path.join(cache_dir, component_name)
-
+    # breakpoint()
     if is_pipeline_module:
         pipeline_module = getattr(pipelines, library_name)
 
@@ -350,7 +350,10 @@ def get_class_obj_and_candidates(
         if library_name == 'JDiffusion':
             library = importlib.import_module('diffusers')
         if JDiffusion_has:
-            c_res = getattr(importlib.import_module('diffusers'), class_name, None)
+            class_obj = getattr(library, class_name)
+            c_res = getattr(library, class_name, None)
+            print(f"Use JDiffusion Defined Class {str(class_obj)}")
+            # c_res = getattr(importlib.import_module('diffusers'), class_name, None)
         else:
             c_res = getattr(library, class_name, None)
         class_candidates = {c: c_res for c in importable_classes.keys()}
@@ -1097,6 +1100,12 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
         revision = kwargs.pop("revision", None)
         from_flax = kwargs.pop("from_flax", False)
         torch_dtype = kwargs.pop("torch_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = kwargs.pop("dtype", None)
+        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
+            import jtorch
+            torch_dtype = jtorch.get_JDtype(torch_dtype)
+            # print(torch_dtype)
         custom_pipeline = kwargs.pop("custom_pipeline", None)
         custom_revision = kwargs.pop("custom_revision", None)
         provider = kwargs.pop("provider", None)
@@ -1107,6 +1116,7 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
         offload_state_dict = kwargs.pop("offload_state_dict", False)
         low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
         variant = kwargs.pop("variant", None)
+        variant = None
         use_safetensors = kwargs.pop("use_safetensors", None)
         use_onnx = kwargs.pop("use_onnx", None)
         load_connected_pipeline = kwargs.pop("load_connected_pipeline", False)
