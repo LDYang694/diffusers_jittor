@@ -311,7 +311,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         save_directory: Union[str, os.PathLike],
         is_main_process: bool = True,
         save_function: Optional[Callable] = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         variant: Optional[str] = None,
         push_to_hub: bool = False,
         **kwargs,
@@ -342,6 +342,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             kwargs (`Dict[str, Any]`, *optional*):
                 Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
+        assert safe_serialization == False, "Safe serialization is not supported now."
         if os.path.isfile(save_directory):
             logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
