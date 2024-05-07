@@ -876,7 +876,7 @@ class LoraLoaderMixin:
         is_main_process: bool = True,
         weight_name: str = None,
         save_function: Callable = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
     ):
         r"""
         Save the LoRA parameters corresponding to the UNet and text encoder.
@@ -1485,7 +1485,7 @@ class StableDiffusionXLLoraLoaderMixin(LoraLoaderMixin):
         is_main_process: bool = True,
         weight_name: str = None,
         save_function: Callable = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
     ):
         r"""
         Save the LoRA parameters corresponding to the UNet and text encoder.

@@ -1379,7 +1379,7 @@ class DemoFusionSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderM
         is_main_process: bool = True,
         weight_name: str = None,
         save_function: Callable = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
     ):
         state_dict = {}
 

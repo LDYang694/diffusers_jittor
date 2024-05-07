@@ -394,7 +394,7 @@ class PushToHubMixin:
         private: Optional[bool] = None,
         token: Optional[str] = None,
         create_pr: bool = False,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         variant: Optional[str] = None,
     ) -> str:
         """

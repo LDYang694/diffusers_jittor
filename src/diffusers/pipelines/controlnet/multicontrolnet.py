@@ -77,7 +77,7 @@ class MultiControlNetModel(ModelMixin):
         save_directory: Union[str, os.PathLike],
         is_main_process: bool = True,
         save_function: Callable = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         variant: Optional[str] = None,
     ):
         """
