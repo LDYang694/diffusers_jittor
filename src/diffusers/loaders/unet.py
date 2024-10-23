@@ -410,7 +410,7 @@ class UNet2DConditionLoadersMixin:
         is_main_process: bool = True,
         weight_name: str = None,
         save_function: Callable = None,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         **kwargs,
     ):
         r"""

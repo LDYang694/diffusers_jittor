@@ -492,7 +492,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
         self,
         save_directory: str,
         is_main_process: bool = True,
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         variant: Optional[str] = None,
         push_to_hub: bool = False,
         **kwargs,

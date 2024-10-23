@@ -643,7 +643,7 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
     def save_pretrained(
         self,
         save_directory: Union[str, os.PathLike],
-        safe_serialization: bool = True,
+        safe_serialization: bool = False,
         variant: Optional[str] = None,
         push_to_hub: bool = False,
         **kwargs,
